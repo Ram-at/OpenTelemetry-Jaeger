@@ -1,0 +1,221 @@
+# Lab 3 (add-on): Prometheus + Loki, wired into the Tempo lab (file 02).
+# Requires 02-otel-tempo.yaml to be running (it provides Grafana).
+#
+# Apply:   kubectl apply -f 03-metrics-logs-addon.yaml
+# Then:    kubectl rollout restart deploy/otel-collector deploy/grafana -n observability
+#          kubectl set env -n demo deploy/frontend deploy/backend \
+#            OTEL_METRICS_EXPORTER=otlp OTEL_LOGS_EXPORTER=otlp \
+#            OTEL_PYTHON_LOGGING_AUTO_INSTRUMENTATION_ENABLED=true \
+#            OTEL_PYTHON_LOG_CORRELATION=true
+# (the app pods restart and pip install again, ~2 min)
+#
+# UIs: Grafana :30300 | Prometheus :30090
+---
+# ===== Loki (single binary, filesystem storage) =====
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: loki-config
+  namespace: observability
+data:
+  loki.yaml: |
+    auth_enabled: false
+    server:
+      http_listen_port: 3100
+    common:
+      instance_addr: 127.0.0.1
+      path_prefix: /loki
+      replication_factor: 1
+      ring:
+        kvstore:
+          store: inmemory
+      storage:
+        filesystem:
+          chunks_directory: /loki/chunks
+          rules_directory: /loki/rules
+    schema_config:
+      configs:
+        - from: "2024-01-01"
+          store: tsdb
+          object_store: filesystem
+          schema: v13
+          index:
+            prefix: index_
+            period: 24h
+    limits_config:
+      allow_structured_metadata: true
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: loki
+  namespace: observability
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: loki }
+  template:
+    metadata:
+      labels: { app: loki }
+    spec:
+      containers:
+        - name: loki
+          image: grafana/loki:3.2.0
+          args: ["-config.file=/conf/loki.yaml"]
+          ports:
+            - containerPort: 3100
+          volumeMounts:
+            - { name: conf, mountPath: /conf }
+            - { name: data, mountPath: /loki }
+      volumes:
+        - name: conf
+          configMap: { name: loki-config }
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: loki
+  namespace: observability
+spec:
+  selector: { app: loki }
+  ports:
+    - { port: 3100, targetPort: 3100 }
+---
+# ===== Prometheus (scrapes the collector's metrics endpoint) =====
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: observability
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 15s
+    scrape_configs:
+      - job_name: otel-collector
+        static_configs:
+          - targets: ["otel-collector.observability:8889"]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  namespace: observability
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: prometheus }
+  template:
+    metadata:
+      labels: { app: prometheus }
+    spec:
+      containers:
+        - name: prometheus
+          image: prom/prometheus:v2.54.1
+          args:
+            - --config.file=/etc/prometheus/prometheus.yml
+            - --storage.tsdb.path=/prometheus
+            - --storage.tsdb.retention.time=2h
+          ports:
+            - containerPort: 9090
+          volumeMounts:
+            - { name: conf, mountPath: /etc/prometheus }
+            - { name: data, mountPath: /prometheus }
+      volumes:
+        - name: conf
+          configMap: { name: prometheus-config }
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  namespace: observability
+spec:
+  type: NodePort
+  selector: { app: prometheus }
+  ports:
+    - { port: 9090, targetPort: 9090, nodePort: 30090 }
+---
+# ===== Collector config: now handles traces + metrics + logs =====
+# (replaces the ConfigMap from file 02)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: otel-collector-config
+  namespace: observability
+data:
+  config.yaml: |
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+          http:
+            endpoint: 0.0.0.0:4318
+    processors:
+      batch: {}
+    exporters:
+      debug:
+        verbosity: basic
+      otlp/traces:
+        endpoint: tempo.observability.svc.cluster.local:4317
+        tls:
+          insecure: true
+      prometheus:
+        endpoint: 0.0.0.0:8889
+        resource_to_telemetry_conversion:
+          enabled: true
+      otlphttp/loki:
+        endpoint: http://loki.observability:3100/otlp
+    service:
+      pipelines:
+        traces:
+          receivers: [otlp]
+          processors: [batch]
+          exporters: [otlp/traces, debug]
+        metrics:
+          receivers: [otlp]
+          processors: [batch]
+          exporters: [prometheus]
+        logs:
+          receivers: [otlp]
+          processors: [batch]
+          exporters: [otlphttp/loki]
+---
+# ===== Grafana datasources: Tempo + Prometheus + Loki (with trace<->log links) =====
+# (replaces the ConfigMap from file 02)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-datasources
+  namespace: observability
+data:
+  datasources.yaml: |
+    apiVersion: 1
+    datasources:
+      - name: Tempo
+        type: tempo
+        uid: tempo
+        access: proxy
+        url: http://tempo.observability:3200
+        isDefault: true
+        jsonData:
+          tracesToLogsV2:
+            datasourceUid: loki
+            filterByTraceID: true
+            customQuery: true
+            query: '{service_name="$${__span.tags["service.name"]}"} | trace_id="$${__span.traceId}"'
+      - name: Prometheus
+        type: prometheus
+        uid: prometheus
+        access: proxy
+        url: http://prometheus.observability:9090
+      - name: Loki
+        type: loki
+        uid: loki
+        access: proxy
+        url: http://loki.observability:3100
